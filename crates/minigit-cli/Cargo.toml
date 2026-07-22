@@ -1,0 +1,15 @@
+[package]
+name = "minigit-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "minigit"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+minigit-core = { path = "../minigit-core" }
+
