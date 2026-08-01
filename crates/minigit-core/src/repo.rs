@@ -41,6 +41,12 @@ pub enum RepoError {
     InvalidObjectHash(String),
     #[error("object is corrupted: {0}")]
     CorruptedObject(ObjectHash),
+    #[error("cannot create a branch before the first commit")]
+    NoCommitsYet,
+    #[error("branch already exists: {0}")]
+    BranchAlreadyExists(String),
+    #[error("invalid branch name: {0}")]
+    InvalidBranchName(String),
 }
 
 pub type Result<T> = std::result::Result<T, RepoError>;
@@ -150,6 +156,19 @@ impl Repository {
         Ok(())
     }
 
+    fn validate_branch_name(name: &str) -> Result<()> {
+        let is_valid = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+
+        if !is_valid {
+            return Err(RepoError::InvalidBranchName(name.to_string()));
+        }
+
+        Ok(())
+    }
+
     fn current_branch_ref(&self) -> Result<String> {
         let head = fs::read_to_string(self.git_dir.join("HEAD"))?;
 
@@ -176,6 +195,21 @@ impl Repository {
         let branch_ref = self.current_branch_ref()?;
 
         fs::write(self.git_dir.join(branch_ref), format!("{commit_hash}\n"))?;
+
+        Ok(())
+    }
+
+    pub fn create_branch(&self, name: &str) -> Result<()> {
+        Self::validate_branch_name(name)?;
+
+        let branch_path = self.git_dir.join("refs").join("heads").join(name);
+
+        if branch_path.exists() {
+            return Err(RepoError::BranchAlreadyExists(name.to_string()));
+        }
+
+        let commit_hash = self.head_commit()?.ok_or(RepoError::NoCommitsYet)?;
+        fs::write(branch_path, format!("{commit_hash}\n"))?;
 
         Ok(())
     }
@@ -568,6 +602,58 @@ mod tests {
 
         repo.update_current_branch("abc123").unwrap();
         assert_eq!(repo.head_commit().unwrap(), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn create_branch_points_to_current_commit() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        fs::write(temp.path().join("hello.txt"), "hello").unwrap();
+        repo.add("hello.txt").unwrap();
+        let commit_hash = repo.commit("first").unwrap();
+
+        repo.create_branch("feature").unwrap();
+
+        let branch_contents =
+            fs::read_to_string(repo.git_dir.join("refs").join("heads").join("feature")).unwrap();
+
+        assert_eq!(branch_contents.trim(), commit_hash);
+    }
+
+    #[test]
+    fn create_branch_requires_a_commit() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let result = repo.create_branch("feature");
+
+        assert!(matches!(result, Err(RepoError::NoCommitsYet)));
+    }
+
+    #[test]
+    fn create_branch_rejects_duplicate_name() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        fs::write(temp.path().join("hello.txt"), "hello").unwrap();
+        repo.add("hello.txt").unwrap();
+        repo.commit("first").unwrap();
+
+        repo.create_branch("feature").unwrap();
+        let result = repo.create_branch("feature");
+
+        assert!(matches!(result, Err(RepoError::BranchAlreadyExists(_))));
+    }
+
+    #[test]
+    fn create_branch_rejects_invalid_name() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let result = repo.create_branch("../feature");
+
+        assert!(matches!(result, Err(RepoError::InvalidBranchName(_))));
     }
 
     #[test]

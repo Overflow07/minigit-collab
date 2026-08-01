@@ -26,6 +26,9 @@ enum Command {
     Checkout {
         commit: String,
     },
+    Branch {
+        name: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -81,6 +84,12 @@ fn main() -> Result<()> {
             let repo = Repository::discover(env::current_dir()?)?;
             repo.checkout(&commit)?;
             println!("checked out {commit}");
+        }
+
+        Command::Branch { name } => {
+            let repo = Repository::discover(env::current_dir()?)?;
+            repo.create_branch(&name)?;
+            println!("created branch {name}");
         }
     }
 
