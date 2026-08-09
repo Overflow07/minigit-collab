@@ -34,7 +34,7 @@ pub struct Tree {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     pub tree: ObjectHash,
-    pub parent: Option<ObjectHash>,
+    pub parents: Vec<ObjectHash>,
     pub message: String,
     pub timestamp_secs: u64,
 }

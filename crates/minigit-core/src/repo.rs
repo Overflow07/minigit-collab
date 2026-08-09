@@ -4,7 +4,7 @@
 //! one Git concept we will build later.
 
 use crate::object::{hash_bytes, Blob, Commit, Object, ObjectHash, Tree, TreeEntry};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,12 +41,24 @@ pub enum RepoError {
     InvalidObjectHash(String),
     #[error("object is corrupted: {0}")]
     CorruptedObject(ObjectHash),
-    #[error("cannot create a branch before the first commit")]
+    #[error("repository has no commits yet")]
     NoCommitsYet,
     #[error("branch already exists: {0}")]
     BranchAlreadyExists(String),
     #[error("invalid branch name: {0}")]
     InvalidBranchName(String),
+    #[error("HEAD is detached")]
+    DetachedHead,
+    #[error("HEAD is empty or malformed")]
+    InvalidHead,
+    #[error("branch not found: {0}")]
+    BranchNotFound(String),
+    #[error("branches do not share a common ancestor")]
+    NoCommonAncestor,
+    #[error("cannot commit while merge conflicts remain")]
+    UnresolvedConflicts,
+    #[error("a merge is already in progress")]
+    MergeInProgress,
 }
 
 pub type Result<T> = std::result::Result<T, RepoError>;
@@ -56,6 +68,20 @@ pub struct RepositoryStatus {
     pub staged: Vec<String>,
     pub modified: Vec<String>,
     pub untracked: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    AlreadyUpToDate,
+    FastForward(ObjectHash),
+    Merged(ObjectHash),
+    Conflicts(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryMerge {
+    Resolved(Option<ObjectHash>),
+    Conflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -175,19 +201,60 @@ impl Repository {
         Ok(head
             .trim()
             .strip_prefix("ref: ")
-            .ok_or(RepoError::NotRepository)?
+            .ok_or(RepoError::DetachedHead)?
             .to_string())
     }
 
     fn head_commit(&self) -> Result<Option<ObjectHash>> {
-        let branch_ref = self.current_branch_ref()?;
-        let content = fs::read_to_string(self.git_dir.join(branch_ref))?;
-        let trimmed = content.trim();
+        let head = fs::read_to_string(self.git_dir.join("HEAD"))?;
+        let trimmed = head.trim();
 
-        if trimmed.is_empty() {
-            Ok(None)
+        if let Some(branch_ref) = trimmed.strip_prefix("ref: ") {
+            let content = fs::read_to_string(self.git_dir.join(branch_ref))?;
+            let commit_hash = content.trim();
+
+            if commit_hash.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(commit_hash.to_string()))
+            }
+        } else if trimmed.is_empty() {
+            Err(RepoError::InvalidHead)
         } else {
             Ok(Some(trimmed.to_string()))
+        }
+    }
+
+    fn read_merge_head(&self) -> Result<Option<ObjectHash>> {
+        let path = self.git_dir.join("MERGE_HEAD");
+
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                let hash = content.trim();
+                Self::validate_object_hash(hash)?;
+
+                Ok(Some(hash.to_string()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn ensure_no_merge_in_progress(&self) -> Result<()> {
+        if self.read_merge_head()?.is_some() {
+            return Err(RepoError::MergeInProgress);
+        }
+
+        Ok(())
+    }
+
+    fn read_merge_conflicts(&self) -> Result<Vec<String>> {
+        let path = self.git_dir.join("MERGE_CONFLICTS");
+
+        match fs::read(path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -214,6 +281,102 @@ impl Repository {
         Ok(())
     }
 
+    fn branch_commit(&self, name: &str) -> Result<ObjectHash> {
+        Self::validate_branch_name(name)?;
+
+        let branch_path = self.git_dir.join("refs").join("heads").join(name);
+
+        if !branch_path.is_file() {
+            return Err(RepoError::BranchNotFound(name.to_string()));
+        }
+
+        let content = fs::read_to_string(branch_path)?;
+        let commit_hash = content.trim();
+
+        if commit_hash.is_empty() {
+            return Err(RepoError::NoCommitsYet);
+        }
+
+        Self::validate_object_hash(commit_hash)?;
+
+        Ok(commit_hash.to_string())
+    }
+
+    pub fn switch_branch(&self, name: &str) -> Result<()> {
+        self.ensure_no_merge_in_progress()?;
+
+        let commit_hash = self.branch_commit(name)?;
+        self.restore_commit(&commit_hash)?;
+
+        let branch_ref = format!("refs/heads/{name}");
+        fs::write(self.git_dir.join("HEAD"), format!("ref: {branch_ref}\n"))?;
+
+        Ok(())
+    }
+
+    pub fn merge(&self, branch: &str) -> Result<MergeOutcome> {
+        self.ensure_no_merge_in_progress()?;
+        self.current_branch_ref()?;
+
+        let current_hash = self.head_commit()?.ok_or(RepoError::NoCommitsYet)?;
+        let target_hash = self.branch_commit(branch)?;
+
+        let ancestor = self
+            .find_common_ancestor(&current_hash, &target_hash)?
+            .ok_or(RepoError::NoCommonAncestor)?;
+
+        if ancestor == target_hash {
+            return Ok(MergeOutcome::AlreadyUpToDate);
+        }
+
+        if ancestor == current_hash {
+            self.restore_commit(&target_hash)?;
+            self.update_current_branch(&target_hash)?;
+
+            return Ok(MergeOutcome::FastForward(target_hash));
+        }
+
+        let ancestor_entries = self.entries_for_commit(&ancestor)?;
+        let current_entries = self.entries_for_commit(&current_hash)?;
+        let target_entries = self.entries_for_commit(&target_hash)?;
+
+        let (merged_entries, conflicts) =
+            Self::merge_entries(&ancestor_entries, &current_entries, &target_entries);
+
+        if !conflicts.is_empty() {
+            self.restore_entries(&merged_entries)?;
+
+            for path in &conflicts {
+                self.write_conflict_file(
+                    path,
+                    current_entries.get(path),
+                    target_entries.get(path),
+                    branch,
+                )?;
+            }
+
+            fs::write(self.git_dir.join("MERGE_HEAD"), format!("{target_hash}\n"))?;
+
+            fs::write(
+                self.git_dir.join("MERGE_CONFLICTS"),
+                serde_json::to_vec_pretty(&conflicts)?,
+            )?;
+
+            return Ok(MergeOutcome::Conflicts(conflicts));
+        }
+
+        let merge_hash = self.write_commit_object(
+            &merged_entries,
+            vec![current_hash, target_hash],
+            format!("Merge branch '{branch}'"),
+        )?;
+
+        self.restore_commit(&merge_hash)?;
+        self.update_current_branch(&merge_hash)?;
+
+        Ok(MergeOutcome::Merged(merge_hash))
+    }
+
     pub fn add(&self, path: impl AsRef<Path>) -> Result<ObjectHash> {
         let path = path.as_ref();
 
@@ -225,44 +388,99 @@ impl Repository {
         let object = Object::Blob(Blob { bytes });
         let hash = self.write_object(&object)?;
 
+        let path_string = path.to_string_lossy().to_string();
+
         let mut index = self.read_index()?;
-        index
-            .entries
-            .insert(path.to_string_lossy().to_string(), hash.clone());
+        index.entries.insert(path_string.clone(), hash.clone());
         self.write_index(&index)?;
+
+        let mut conflicts = self.read_merge_conflicts()?;
+        let previous_len = conflicts.len();
+
+        conflicts.retain(|conflict| conflict != &path_string);
+
+        if conflicts.len() != previous_len {
+            fs::write(
+                self.git_dir.join("MERGE_CONFLICTS"),
+                serde_json::to_vec_pretty(&conflicts)?,
+            )?;
+        }
 
         Ok(hash)
     }
 
-    pub fn commit(&self, message: impl Into<String>) -> Result<ObjectHash> {
-        let index = self.read_index()?;
+    fn write_commit_object(
+        &self,
+        entries: &BTreeMap<String, ObjectHash>,
+        parents: Vec<ObjectHash>,
+        message: String,
+    ) -> Result<ObjectHash> {
+        let mut tree_entries = Vec::new();
 
-        let committed = self.committed_entries()?;
-
-        if index.entries == committed {
-            return Err(RepoError::NothingToCommit);
-        }
-        let entries = index
-            .entries
-            .iter()
-            .map(|(path, blob)| TreeEntry {
+        for (path, blob) in entries {
+            tree_entries.push(TreeEntry {
                 path: path.clone(),
                 blob: blob.clone(),
-            })
-            .collect();
+            });
+        }
 
-        let tree = Object::Tree(Tree { entries });
+        let tree = Object::Tree(Tree {
+            entries: tree_entries,
+        });
+
         let tree_hash = self.write_object(&tree)?;
 
         let commit = Object::Commit(Commit {
             tree: tree_hash,
-            parent: self.head_commit()?,
-            message: message.into(),
+            parents,
+            message,
             timestamp_secs: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         });
 
-        let commit_hash = self.write_object(&commit)?;
+        self.write_object(&commit)
+    }
+
+    pub fn commit(&self, message: impl Into<String>) -> Result<ObjectHash> {
+        self.current_branch_ref()?;
+
+        let conflicts = self.read_merge_conflicts()?;
+
+        if !conflicts.is_empty() {
+            return Err(RepoError::UnresolvedConflicts);
+        }
+
+        let merge_parent = self.read_merge_head()?;
+        let completing_merge = merge_parent.is_some();
+
+        let index = self.read_index()?;
+        let committed = self.committed_entries()?;
+
+        if index.entries == committed && !completing_merge {
+            return Err(RepoError::NothingToCommit);
+        }
+
+        let mut parents = match self.head_commit()? {
+            Some(hash) => vec![hash],
+            None => Vec::new(),
+        };
+
+        if let Some(hash) = merge_parent {
+            parents.push(hash);
+        }
+
+        let commit_hash = self.write_commit_object(&index.entries, parents, message.into())?;
+
         self.update_current_branch(&commit_hash)?;
+
+        if completing_merge {
+            for name in ["MERGE_HEAD", "MERGE_CONFLICTS"] {
+                match fs::remove_file(self.git_dir.join(name)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
 
         Ok(commit_hash)
     }
@@ -276,7 +494,7 @@ impl Repository {
 
             match object {
                 Object::Commit(commit) => {
-                    current = commit.parent.clone();
+                    current = commit.parents.first().cloned();
                     commits.push((hash, commit));
                 }
                 _ => return Err(RepoError::ExpectedCommit),
@@ -287,20 +505,10 @@ impl Repository {
     }
 
     fn committed_entries(&self) -> Result<BTreeMap<String, ObjectHash>> {
-        let commit_hash = match self.head_commit()? {
-            Some(hash) => hash,
-            None => return Ok(BTreeMap::new()),
-        };
-
-        let tree = self.tree_for_commit(&commit_hash)?;
-
-        let mut entries = BTreeMap::new();
-
-        for entry in tree.entries {
-            entries.insert(entry.path, entry.blob);
+        match self.head_commit()? {
+            Some(hash) => self.entries_for_commit(&hash),
+            None => Ok(BTreeMap::new()),
         }
-
-        Ok(entries)
     }
 
     pub fn status(&self) -> Result<RepositoryStatus> {
@@ -364,19 +572,18 @@ impl Repository {
         })
     }
 
-    pub fn checkout(&self, commit_hash: &str) -> Result<()> {
-        let tree = self.tree_for_commit(commit_hash)?;
-
+    fn restore_entries(&self, entries: &BTreeMap<String, ObjectHash>) -> Result<()> {
         let current_index = self.read_index()?;
+        let target_index = Index {
+            entries: entries.clone(),
+        };
 
-        let mut target_index = Index::default();
-
-        for entry in tree.entries {
-            let relative = Path::new(&entry.path);
+        for (path, blob_hash) in entries {
+            let relative = Path::new(path);
             Self::validate_repo_path(relative)?;
             self.validate_no_symlinks(relative)?;
 
-            let blob = match self.read_object(&entry.blob)? {
+            let blob = match self.read_object(blob_hash)? {
                 Object::Blob(blob) => blob,
                 _ => return Err(RepoError::ExpectedBlob),
             };
@@ -388,12 +595,10 @@ impl Repository {
             }
 
             fs::write(destination, blob.bytes)?;
-
-            target_index.entries.insert(entry.path, entry.blob);
         }
 
         for path in current_index.entries.keys() {
-            if target_index.entries.contains_key(path) {
+            if entries.contains_key(path) {
                 continue;
             }
 
@@ -409,8 +614,23 @@ impl Repository {
                 Err(error) => return Err(error.into()),
             }
         }
+
         self.write_index(&target_index)?;
-        self.update_current_branch(commit_hash)?;
+
+        Ok(())
+    }
+
+    fn restore_commit(&self, commit_hash: &str) -> Result<()> {
+        let entries = self.entries_for_commit(commit_hash)?;
+        self.restore_entries(&entries)
+    }
+
+    pub fn checkout(&self, commit_hash: &str) -> Result<()> {
+        self.ensure_no_merge_in_progress()?;
+
+        self.restore_commit(commit_hash)?;
+
+        fs::write(self.git_dir.join("HEAD"), format!("{commit_hash}\n"))?;
 
         Ok(())
     }
@@ -425,6 +645,157 @@ impl Repository {
             Object::Tree(tree) => Ok(tree),
             _ => Err(RepoError::ExpectedTree),
         }
+    }
+
+    fn entries_for_commit(&self, commit_hash: &str) -> Result<BTreeMap<String, ObjectHash>> {
+        let tree = self.tree_for_commit(commit_hash)?;
+        let mut entries = BTreeMap::new();
+
+        for entry in tree.entries {
+            entries.insert(entry.path, entry.blob);
+        }
+
+        Ok(entries)
+    }
+
+    fn blob_bytes_for_merge(&self, hash: Option<&ObjectHash>) -> Result<Vec<u8>> {
+        match hash {
+            None => Ok(Vec::new()),
+            Some(hash) => match self.read_object(hash)? {
+                Object::Blob(blob) => Ok(blob.bytes),
+                _ => Err(RepoError::ExpectedBlob),
+            },
+        }
+    }
+
+    fn conflict_bytes(current: &[u8], target: &[u8], target_branch: &str) -> Vec<u8> {
+        let mut result = Vec::new();
+
+        result.extend_from_slice(b"<<<<<<< HEAD\n");
+        result.extend_from_slice(current);
+
+        if !current.ends_with(b"\n") {
+            result.push(b'\n');
+        }
+
+        result.extend_from_slice(b"=======\n");
+        result.extend_from_slice(target);
+
+        if !target.ends_with(b"\n") {
+            result.push(b'\n');
+        }
+
+        result.extend_from_slice(format!(">>>>>>> {target_branch}\n").as_bytes());
+
+        result
+    }
+
+    fn write_conflict_file(
+        &self,
+        path: &str,
+        current_hash: Option<&ObjectHash>,
+        target_hash: Option<&ObjectHash>,
+        target_branch: &str,
+    ) -> Result<()> {
+        let relative = Path::new(path);
+
+        Self::validate_repo_path(relative)?;
+        self.validate_no_symlinks(relative)?;
+
+        let current = self.blob_bytes_for_merge(current_hash)?;
+        let target = self.blob_bytes_for_merge(target_hash)?;
+        let contents = Self::conflict_bytes(&current, &target, target_branch);
+
+        let destination = self.worktree.join(relative);
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(destination, contents)?;
+
+        Ok(())
+    }
+
+    fn merge_entry(
+        ancestor: Option<&ObjectHash>,
+        current: Option<&ObjectHash>,
+        target: Option<&ObjectHash>,
+    ) -> EntryMerge {
+        if current == target {
+            EntryMerge::Resolved(current.cloned())
+        } else if current == ancestor {
+            EntryMerge::Resolved(target.cloned())
+        } else if target == ancestor {
+            EntryMerge::Resolved(current.cloned())
+        } else {
+            EntryMerge::Conflict
+        }
+    }
+
+    fn merge_entries(
+        ancestor: &BTreeMap<String, ObjectHash>,
+        current: &BTreeMap<String, ObjectHash>,
+        target: &BTreeMap<String, ObjectHash>,
+    ) -> (BTreeMap<String, ObjectHash>, Vec<String>) {
+        let mut paths = BTreeSet::new();
+        paths.extend(ancestor.keys().cloned());
+        paths.extend(current.keys().cloned());
+        paths.extend(target.keys().cloned());
+
+        let mut merged = BTreeMap::new();
+        let mut conflicts = Vec::new();
+
+        for path in paths {
+            match Self::merge_entry(ancestor.get(&path), current.get(&path), target.get(&path)) {
+                EntryMerge::Resolved(Some(hash)) => {
+                    merged.insert(path, hash);
+                }
+                EntryMerge::Resolved(None) => {}
+                EntryMerge::Conflict => {
+                    conflicts.push(path);
+                }
+            }
+        }
+
+        (merged, conflicts)
+    }
+
+    fn parents_of_commit(&self, commit_hash: &str) -> Result<Vec<ObjectHash>> {
+        match self.read_object(commit_hash)? {
+            Object::Commit(commit) => Ok(commit.parents),
+            _ => Err(RepoError::ExpectedCommit),
+        }
+    }
+
+    fn find_common_ancestor(
+        &self,
+        left_hash: &str,
+        right_hash: &str,
+    ) -> Result<Option<ObjectHash>> {
+        let mut left_ancestors = BTreeSet::new();
+        let mut left_to_visit = vec![left_hash.to_string()];
+
+        while let Some(hash) = left_to_visit.pop() {
+            if left_ancestors.insert(hash.clone()) {
+                left_to_visit.extend(self.parents_of_commit(&hash)?);
+            }
+        }
+
+        let mut right_visited = BTreeSet::new();
+        let mut right_to_visit = vec![right_hash.to_string()];
+
+        while let Some(hash) = right_to_visit.pop() {
+            if left_ancestors.contains(&hash) {
+                return Ok(Some(hash));
+            }
+
+            if right_visited.insert(hash.clone()) {
+                right_to_visit.extend(self.parents_of_commit(&hash)?);
+            }
+        }
+
+        Ok(None)
     }
 
     fn validate_no_symlinks(&self, path: &Path) -> Result<()> {
@@ -466,6 +837,57 @@ impl Repository {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn merge_entry_follows_three_way_rules() {
+        let ancestor = "ancestor".to_string();
+        let current = "current".to_string();
+        let target = "target".to_string();
+
+        assert_eq!(
+            Repository::merge_entry(Some(&ancestor), Some(&current), Some(&current)),
+            EntryMerge::Resolved(Some(current.clone()))
+        );
+
+        assert_eq!(
+            Repository::merge_entry(Some(&ancestor), Some(&ancestor), Some(&target)),
+            EntryMerge::Resolved(Some(target.clone()))
+        );
+
+        assert_eq!(
+            Repository::merge_entry(Some(&ancestor), Some(&current), Some(&ancestor)),
+            EntryMerge::Resolved(Some(current.clone()))
+        );
+
+        assert_eq!(
+            Repository::merge_entry(Some(&ancestor), Some(&current), Some(&target)),
+            EntryMerge::Conflict
+        );
+    }
+
+    #[test]
+    fn merge_entries_combines_independent_changes() {
+        let ancestor = BTreeMap::from([
+            ("a.txt".to_string(), "a-old".to_string()),
+            ("b.txt".to_string(), "b-old".to_string()),
+        ]);
+
+        let current = BTreeMap::from([
+            ("a.txt".to_string(), "a-new".to_string()),
+            ("b.txt".to_string(), "b-old".to_string()),
+        ]);
+
+        let target = BTreeMap::from([
+            ("a.txt".to_string(), "a-old".to_string()),
+            ("b.txt".to_string(), "b-new".to_string()),
+        ]);
+
+        let (merged, conflicts) = Repository::merge_entries(&ancestor, &current, &target);
+
+        assert_eq!(merged.get("a.txt"), Some(&"a-new".to_string()));
+        assert_eq!(merged.get("b.txt"), Some(&"b-new".to_string()));
+        assert!(conflicts.is_empty());
+    }
 
     #[test]
     fn init_creates_minigit_directory_layout() {
@@ -657,6 +1079,222 @@ mod tests {
     }
 
     #[test]
+    fn switch_branch_restores_files_and_updates_head() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let file_path = temp.path().join("hello.txt");
+
+        fs::write(&file_path, "version one").unwrap();
+        repo.add("hello.txt").unwrap();
+        let first = repo.commit("first commit").unwrap();
+
+        repo.create_branch("feature").unwrap();
+
+        fs::write(&file_path, "version two").unwrap();
+        repo.add("hello.txt").unwrap();
+        let second = repo.commit("second commit").unwrap();
+
+        repo.switch_branch("feature").unwrap();
+
+        assert_eq!(fs::read_to_string(file_path).unwrap(), "version one");
+        assert_eq!(repo.current_branch_ref().unwrap(), "refs/heads/feature");
+        assert_eq!(repo.head_commit().unwrap(), Some(first));
+
+        let main =
+            fs::read_to_string(repo.git_dir.join("refs").join("heads").join("main")).unwrap();
+
+        assert_eq!(main.trim(), second);
+    }
+
+    #[test]
+    fn switch_branch_rejects_missing_branch() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let result = repo.switch_branch("missing");
+
+        assert!(matches!(result, Err(RepoError::BranchNotFound(_))));
+    }
+
+    #[test]
+    fn find_common_ancestor_finds_branch_point() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let file_path = temp.path().join("hello.txt");
+
+        fs::write(&file_path, "base").unwrap();
+        repo.add("hello.txt").unwrap();
+        let base = repo.commit("base commit").unwrap();
+
+        repo.create_branch("feature").unwrap();
+
+        fs::write(&file_path, "main version").unwrap();
+        repo.add("hello.txt").unwrap();
+        let main_tip = repo.commit("main commit").unwrap();
+
+        repo.switch_branch("feature").unwrap();
+
+        fs::write(&file_path, "feature version").unwrap();
+        repo.add("hello.txt").unwrap();
+        let feature_tip = repo.commit("feature commit").unwrap();
+
+        let ancestor = repo.find_common_ancestor(&main_tip, &feature_tip).unwrap();
+
+        assert_eq!(ancestor, Some(base));
+    }
+
+    #[test]
+    fn merge_fast_forwards_current_branch() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let file_path = temp.path().join("hello.txt");
+
+        fs::write(&file_path, "base").unwrap();
+        repo.add("hello.txt").unwrap();
+        repo.commit("base commit").unwrap();
+
+        repo.create_branch("feature").unwrap();
+        repo.switch_branch("feature").unwrap();
+
+        fs::write(&file_path, "feature version").unwrap();
+        repo.add("hello.txt").unwrap();
+        let feature_tip = repo.commit("feature commit").unwrap();
+
+        repo.switch_branch("main").unwrap();
+        let outcome = repo.merge("feature").unwrap();
+
+        assert_eq!(outcome, MergeOutcome::FastForward(feature_tip.clone()));
+        assert_eq!(repo.head_commit().unwrap(), Some(feature_tip));
+        assert_eq!(fs::read_to_string(file_path).unwrap(), "feature version");
+    }
+
+    #[test]
+    fn merge_combines_independent_branch_changes() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let a_path = temp.path().join("a.txt");
+        let b_path = temp.path().join("b.txt");
+
+        fs::write(&a_path, "a-old").unwrap();
+        fs::write(&b_path, "b-old").unwrap();
+        repo.add("a.txt").unwrap();
+        repo.add("b.txt").unwrap();
+        repo.commit("base").unwrap();
+
+        repo.create_branch("feature").unwrap();
+
+        fs::write(&a_path, "a-main").unwrap();
+        repo.add("a.txt").unwrap();
+        let main_tip = repo.commit("main change").unwrap();
+
+        repo.switch_branch("feature").unwrap();
+        fs::write(&b_path, "b-feature").unwrap();
+        repo.add("b.txt").unwrap();
+        let feature_tip = repo.commit("feature change").unwrap();
+
+        repo.switch_branch("main").unwrap();
+        let outcome = repo.merge("feature").unwrap();
+
+        let merge_hash = match outcome {
+            MergeOutcome::Merged(hash) => hash,
+            _ => panic!("expected a three-way merge"),
+        };
+
+        assert_eq!(fs::read_to_string(a_path).unwrap(), "a-main");
+        assert_eq!(fs::read_to_string(b_path).unwrap(), "b-feature");
+        assert_eq!(repo.head_commit().unwrap(), Some(merge_hash.clone()));
+
+        match repo.read_object(&merge_hash).unwrap() {
+            Object::Commit(commit) => {
+                assert_eq!(commit.parents, vec![main_tip, feature_tip]);
+            }
+            _ => panic!("expected commit object"),
+        }
+    }
+
+    #[test]
+    fn merge_conflict_can_be_resolved_and_committed() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let file_path = temp.path().join("notes.txt");
+
+        fs::write(&file_path, "base").unwrap();
+        repo.add("notes.txt").unwrap();
+        repo.commit("base").unwrap();
+
+        repo.create_branch("feature").unwrap();
+
+        fs::write(&file_path, "main version").unwrap();
+        repo.add("notes.txt").unwrap();
+        let main_tip = repo.commit("main change").unwrap();
+
+        repo.switch_branch("feature").unwrap();
+        fs::write(&file_path, "feature version").unwrap();
+        repo.add("notes.txt").unwrap();
+        let feature_tip = repo.commit("feature change").unwrap();
+
+        repo.switch_branch("main").unwrap();
+        let outcome = repo.merge("feature").unwrap();
+
+        assert_eq!(
+            outcome,
+            MergeOutcome::Conflicts(vec!["notes.txt".to_string()])
+        );
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "<<<<<<< HEAD\nmain version\n=======\nfeature version\n>>>>>>> feature\n"
+        );
+        assert!(matches!(
+            repo.commit("too early"),
+            Err(RepoError::UnresolvedConflicts)
+        ));
+        assert!(matches!(
+            repo.switch_branch("feature"),
+            Err(RepoError::MergeInProgress)
+        ));
+
+        fs::write(&file_path, "resolved version").unwrap();
+        repo.add("notes.txt").unwrap();
+        let merge_hash = repo.commit("resolve merge").unwrap();
+
+        match repo.read_object(&merge_hash).unwrap() {
+            Object::Commit(commit) => {
+                assert_eq!(commit.parents, vec![main_tip, feature_tip]);
+            }
+            _ => panic!("expected commit object"),
+        }
+
+        assert_eq!(repo.head_commit().unwrap(), Some(merge_hash));
+        assert!(!repo.git_dir.join("MERGE_HEAD").exists());
+        assert!(!repo.git_dir.join("MERGE_CONFLICTS").exists());
+    }
+
+    #[test]
+    fn merge_reports_already_up_to_date() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let file_path = temp.path().join("hello.txt");
+
+        fs::write(&file_path, "base").unwrap();
+        repo.add("hello.txt").unwrap();
+        repo.commit("base commit").unwrap();
+
+        repo.create_branch("feature").unwrap();
+
+        fs::write(&file_path, "main is newer").unwrap();
+        repo.add("hello.txt").unwrap();
+        let main_tip = repo.commit("main commit").unwrap();
+
+        let outcome = repo.merge("feature").unwrap();
+
+        assert_eq!(outcome, MergeOutcome::AlreadyUpToDate);
+        assert_eq!(repo.head_commit().unwrap(), Some(main_tip));
+    }
+
+    #[test]
     fn commit_creates_commit_and_updates_branch() {
         let temp = TempDir::new().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
@@ -673,11 +1311,27 @@ mod tests {
         match object {
             Object::Commit(commit) => {
                 assert_eq!(commit.message, "first commit");
-                assert_eq!(commit.parent, None);
+                assert!(commit.parents.is_empty());
             }
 
             _ => panic!("expected commit object"),
         }
+    }
+
+    #[test]
+    fn commit_rejects_detached_head() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        fs::write(temp.path().join("hello.txt"), "hello").unwrap();
+        repo.add("hello.txt").unwrap();
+        let commit_hash = repo.commit("first").unwrap();
+
+        repo.checkout(&commit_hash).unwrap();
+
+        let result = repo.commit("detached commit");
+
+        assert!(matches!(result, Err(RepoError::DetachedHead)));
     }
 
     #[test]
@@ -789,6 +1443,33 @@ mod tests {
         repo.checkout(&commit_hash).unwrap();
 
         assert_eq!(fs::read_to_string(file_path).unwrap(), "original");
+    }
+
+    #[test]
+    fn checkout_detaches_head_without_moving_main() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        fs::write(temp.path().join("hello.txt"), "first").unwrap();
+        repo.add("hello.txt").unwrap();
+        let first = repo.commit("first").unwrap();
+
+        fs::write(temp.path().join("hello.txt"), "second").unwrap();
+        repo.add("hello.txt").unwrap();
+        let second = repo.commit("second").unwrap();
+
+        repo.checkout(&first).unwrap();
+
+        let head = fs::read_to_string(repo.git_dir.join("HEAD")).unwrap();
+        let main =
+            fs::read_to_string(repo.git_dir.join("refs").join("heads").join("main")).unwrap();
+
+        assert_eq!(head.trim(), first);
+        assert_eq!(main.trim(), second);
+        assert!(matches!(
+            repo.current_branch_ref(),
+            Err(RepoError::DetachedHead)
+        ));
     }
 
     #[test]

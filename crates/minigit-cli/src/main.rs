@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use minigit_core::Repository;
+use minigit_core::{MergeOutcome, Repository};
 use std::env;
 
 #[derive(Debug, Parser)]
@@ -28,6 +28,14 @@ enum Command {
     },
     Branch {
         name: String,
+    },
+
+    Switch {
+        branch: String,
+    },
+
+    Merge {
+        branch: String,
     },
 }
 
@@ -90,6 +98,35 @@ fn main() -> Result<()> {
             let repo = Repository::discover(env::current_dir()?)?;
             repo.create_branch(&name)?;
             println!("created branch {name}");
+        }
+
+        Command::Switch { branch } => {
+            let repo = Repository::discover(env::current_dir()?)?;
+            repo.switch_branch(&branch)?;
+            println!("switched to branch {branch}");
+        }
+
+        Command::Merge { branch } => {
+            let repo = Repository::discover(env::current_dir()?)?;
+
+            match repo.merge(&branch)? {
+                MergeOutcome::AlreadyUpToDate => {
+                    println!("already up to date");
+                }
+                MergeOutcome::FastForward(hash) => {
+                    println!("fast-forwarded to {hash}");
+                }
+                MergeOutcome::Merged(hash) => {
+                    println!("created merge commit {hash}");
+                }
+                MergeOutcome::Conflicts(paths) => {
+                    println!("merge conflicts:");
+
+                    for path in paths {
+                        println!("  {path}");
+                    }
+                }
+            }
         }
     }
 
